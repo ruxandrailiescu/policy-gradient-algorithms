@@ -42,12 +42,11 @@ class PPOMemory(object):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, lr: float, 
-                 fc1_dim: int=64, fc2_dim: int=64, ckpt_dir='ppo/ckpt'):
+    def __init__(self, state_dim: int, action_dim: int, lr: float, fc1_dim: int, fc2_dim: int, 
+                 model_ckpt_file, optim_ckpt_file, ckpt_dir='ckpt'):
         super().__init__()
-        os.makedirs(ckpt_dir, exist_ok=True)
-        self.checkpoint_actor = os.path.join(ckpt_dir, 'actor_ppo')
-        self.checkpoint_optim = os.path.join(ckpt_dir, 'optim_actor_ppo')
+        self.checkpoint_actor = os.path.join(ckpt_dir, model_ckpt_file)
+        self.checkpoint_optim = os.path.join(ckpt_dir, optim_ckpt_file)
         self.actor = nn.Sequential(
             nn.Linear(state_dim, fc1_dim),
             nn.ReLU(),
@@ -88,12 +87,11 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, lr: float,
-                 fc1_dim: int=64, fc2_dim: int=64, ckpt_dir='ppo/ckpt'):
+    def __init__(self, state_dim: int, lr: float, fc1_dim: int, fc2_dim: int, 
+                 model_ckpt_file, optim_ckpt_file, ckpt_dir='ckpt'):
         super().__init__()
-        os.makedirs(ckpt_dir, exist_ok=True)
-        self.checkpoint_critic = os.path.join(ckpt_dir, 'critic_ppo')
-        self.checkpoint_optim = os.path.join(ckpt_dir, 'optim_critic_ppo')
+        self.checkpoint_critic = os.path.join(ckpt_dir, model_ckpt_file)
+        self.checkpoint_optim = os.path.join(ckpt_dir, optim_ckpt_file)
         self.critic = nn.Sequential(
             nn.Linear(state_dim, fc1_dim),
             nn.ReLU(),
@@ -119,9 +117,12 @@ class Critic(nn.Module):
 
 class Agent(object):
     def __init__(self, state_dim, action_dim, gamma=0.99, gae_lambda=0.95, 
-                 actor_lr=1e-3, critic_lr=1e-3, policy_clip=0.2, 
+                 actor_lr=1e-3, critic_lr=1e-3, policy_clip=0.2,
+                 fc1_dim=64, fc2_dim=64,
                  batch_size=64, horizon=2048, n_epochs=10,
-                 entropy_coef=0.01, value_coef=0.5, max_grad_norm=0.5):
+                 entropy_coef=0.01, value_coef=0.5, max_grad_norm=0.5,
+                 actor_model='actor_model_', actor_optim='actor_optim_', 
+                 critic_model='critic_model_', critic_optim='critic_optim_'):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.policy_clip = policy_clip
@@ -133,8 +134,8 @@ class Agent(object):
         self.max_grad_norm = max_grad_norm
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.actor = Actor(state_dim, action_dim, actor_lr)
-        self.critic = Critic(state_dim, critic_lr)
+        self.actor = Actor(state_dim, action_dim, actor_lr, fc1_dim, fc2_dim, actor_model, actor_optim)
+        self.critic = Critic(state_dim, critic_lr, fc1_dim, fc2_dim, critic_model, critic_optim)
         self.memory = PPOMemory(horizon, batch_size, state_dim, action_dim, device=self.device)
         self.np_rng = np.random.default_rng()
     
@@ -186,6 +187,8 @@ class Agent(object):
         old_values = self.memory.critic_values[:T]
         advantages, returns = self._compute_gae(last_value)
 
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)   # normalization per rollout
+
         for _ in range(self.n_epochs):
             for batch in self.memory.generate_batches(self.np_rng):
                 b_states = states[batch]
@@ -217,8 +220,6 @@ class Agent(object):
 
     def ppo(self, env, total_steps, seed):
         self.np_rng = np.random.default_rng(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
         def next_seed():
             return int(self.np_rng.integers(0, 2**31 - 1))
@@ -237,7 +238,7 @@ class Agent(object):
                     value = self.critic(obs_t)
 
                 action_env = self._clip_action(env, action.squeeze(0).cpu().numpy())
-                next_obs, reward, term, trunc = env.step(action_env)
+                next_obs, reward, term, trunc, _ = env.step(action_env)
 
                 self.memory.store_memory(obs_t.squeeze(0), action.squeeze(0), reward, value, log_prob, term)
                 obs = next_obs
@@ -245,7 +246,7 @@ class Agent(object):
                 step += 1
 
                 if term or trunc:
-                    history.append(ep_return)
+                    history.append((step, ep_return))   
                     ep_return = 0.0
                     obs, _ = env.reset(seed=next_seed())    # reset inside the rollout
 
@@ -254,7 +255,7 @@ class Agent(object):
             self.learn(last_value)
 
             if history:
-                recent = history[-10:]
+                recent = [r for _, r in history[-10:]]
                 print(f"step {step:>8} | episodes {len(history):>5} | "
                       f"mean return (last {len(recent)}): {np.mean(recent):.2f}")
         return history
