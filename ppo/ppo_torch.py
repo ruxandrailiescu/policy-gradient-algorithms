@@ -5,6 +5,8 @@ import os
 import torch
 import torch.nn as nn
 
+from running_mean import RunningMeanStd
+
 
 class PPOMemory(object):
     def __init__(self, capacity: int, batch_size: int, state_dim: int, action_dim: int,
@@ -118,9 +120,8 @@ class Critic(nn.Module):
 class Agent(object):
     def __init__(self, state_dim, action_dim, gamma=0.99, gae_lambda=0.95, 
                  actor_lr=1e-3, critic_lr=1e-3, policy_clip=0.2,
-                 fc1_dim=64, fc2_dim=64,
-                 batch_size=64, horizon=2048, n_epochs=10,
-                 entropy_coef=0.01, value_coef=0.5, max_grad_norm=0.5,
+                 fc1_dim=64, fc2_dim=64, batch_size=64, horizon=2048, 
+                 n_epochs=10, entropy_coef=0.01, value_coef=0.5,
                  actor_model='actor_model_', actor_optim='actor_optim_', 
                  critic_model='critic_model_', critic_optim='critic_optim_'):
         self.gamma = gamma
@@ -131,9 +132,9 @@ class Agent(object):
         self.n_epochs = n_epochs
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
-        self.max_grad_norm = max_grad_norm
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.ret_rms = RunningMeanStd(device=self.device)
+
         self.actor = Actor(state_dim, action_dim, actor_lr, fc1_dim, fc2_dim, actor_model, actor_optim)
         self.critic = Critic(state_dim, critic_lr, fc1_dim, fc2_dim, critic_model, critic_optim)
         self.memory = PPOMemory(horizon, batch_size, state_dim, action_dim, device=self.device)
@@ -160,8 +161,10 @@ class Agent(object):
     def _compute_gae(self, last_value: torch.Tensor):
         T = self.memory.idx
         rewards = self.memory.rewards[:T]
-        values = self.memory.critic_values[:T]
         dones = self.memory.dones[:T]
+
+        values = self.ret_rms.denormalize(self.memory.critic_values[:T])      # denormalize stored critic values back to original scale
+        last_value = self.ret_rms.denormalize(last_value)
 
         advantages = torch.zeros(T, device=self.device)
         last_gae = 0.0
@@ -177,6 +180,7 @@ class Agent(object):
             advantages[t] = last_gae
         
         returns = advantages + values
+        self.ret_rms.update(returns)
         return advantages, returns
 
     def learn(self, last_value: torch.Tensor):
@@ -204,17 +208,16 @@ class Agent(object):
                 ratio = torch.exp(new_log_probs - b_old_log_probs)
                 surr1 = ratio * b_advantages
                 surr2 = torch.clamp(ratio, 1 - self.policy_clip, 1 + self.policy_clip) * b_advantages
-
                 actor_loss = -torch.min(surr1, surr2).mean()
-                value_loss = (new_values - b_returns).pow(2).mean()
+
+                normalized_returns = self.ret_rms.normalize(b_returns)
+                value_loss = (new_values - normalized_returns).pow(2).mean()
                 entropy_loss = entropy.mean()
                 loss = actor_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
 
                 self.actor.optimizer.zero_grad()
                 self.critic.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.actor.optimizer.step()
                 self.critic.optimizer.step()
 
