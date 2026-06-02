@@ -10,25 +10,27 @@ from running_mean import RunningMeanStd
 
 class PPOMemory(object):
     def __init__(self, capacity: int, batch_size: int, state_dim: int, action_dim: int,
-                 device: torch.device="cpu"):
+                 n_agents: int=1, device: torch.device="cpu"):
         self.capacity = capacity
         self.batch_size = batch_size
+        self.n_agents = n_agents
         self.device = device
         self.idx = 0
 
-        self.states = torch.zeros(capacity, state_dim, device=device)
-        self.actions = torch.zeros(capacity, action_dim, device=device)
-        self.rewards = torch.zeros(capacity, device=device)
-        self.critic_values = torch.zeros(capacity, device=device)
-        self.log_probs = torch.zeros(capacity, device=device)
-        self.dones = torch.zeros(capacity, device=device)
+        self.states = torch.zeros(capacity, n_agents, state_dim, device=device)
+        self.actions = torch.zeros(capacity, n_agents, action_dim, device=device)
+        self.rewards = torch.zeros(capacity, n_agents, device=device)
+        self.critic_values = torch.zeros(capacity, n_agents, device=device)
+        self.log_probs = torch.zeros(capacity, n_agents, device=device)
+        self.dones = torch.zeros(capacity, n_agents, device=device)
 
     def generate_batches(self, rng: np.random.Generator):
-        indices = np.arange(self.idx)
+        n_samples = self.idx * self.n_agents
+        indices = np.arange(n_samples)
         rng.shuffle(indices)
-        batch_start = np.arange(0, self.idx, self.batch_size)
+        batch_start = np.arange(0, n_samples, self.batch_size)
         return [indices[i:i + self.batch_size] for i in batch_start]
-    
+
     def store_memory(self, state, action, reward, critic_value, log_prob, done):
         assert self.idx < self.capacity, "buffer full, call clear_memory"
         self.states[self.idx] = torch.as_tensor(state, dtype=torch.float32, device=self.device)
@@ -37,6 +39,16 @@ class PPOMemory(object):
         self.critic_values[self.idx] = float(critic_value)
         self.log_probs[self.idx] = float(log_prob)
         self.dones[self.idx] = float(done)
+        self.idx += 1
+
+    def store_timestep(self, states, actions, rewards, critic_values, log_probs, dones):
+        assert self.idx < self.capacity, "buffer full, call clear_memory"
+        self.states[self.idx] = states
+        self.actions[self.idx] = actions
+        self.rewards[self.idx] = rewards
+        self.critic_values[self.idx] = critic_values
+        self.log_probs[self.idx] = log_probs
+        self.dones[self.idx] = dones
         self.idx += 1
 
     def clear_memory(self):
@@ -121,8 +133,8 @@ class Agent(object):
     def __init__(self, state_dim, action_dim, gamma=0.99, gae_lambda=0.95, 
                  actor_lr=1e-3, critic_lr=1e-3, policy_clip=0.2,
                  fc1_dim=64, fc2_dim=64, batch_size=64, horizon=2048, 
-                 n_epochs=10, entropy_coef=0.01, value_coef=0.5,
-                 actor_model='actor_model_', actor_optim='actor_optim_', 
+                 n_epochs=10, entropy_coef=0.01, value_coef=0.5, n_agents=1,
+                 actor_model='actor_model_', actor_optim='actor_optim_',
                  critic_model='critic_model_', critic_optim='critic_optim_'):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -137,7 +149,7 @@ class Agent(object):
 
         self.actor = Actor(state_dim, action_dim, actor_lr, fc1_dim, fc2_dim, actor_model, actor_optim)
         self.critic = Critic(state_dim, critic_lr, fc1_dim, fc2_dim, critic_model, critic_optim)
-        self.memory = PPOMemory(horizon, batch_size, state_dim, action_dim, device=self.device)
+        self.memory = PPOMemory(horizon, batch_size, state_dim, action_dim, n_agents=n_agents, device=self.device)
         self.np_rng = np.random.default_rng()
     
     def remember(self, state, action, reward, critic_value, log_prob, done):
@@ -166,7 +178,7 @@ class Agent(object):
         values = self.ret_rms.denormalize(self.memory.critic_values[:T])      # denormalize stored critic values back to original scale
         last_value = self.ret_rms.denormalize(last_value)
 
-        advantages = torch.zeros(T, device=self.device)
+        advantages = torch.zeros_like(rewards)
         last_gae = 0.0
         for t in reversed(range(T)):
             if t == T-1:
@@ -180,15 +192,15 @@ class Agent(object):
             advantages[t] = last_gae
         
         returns = advantages + values
-        self.ret_rms.update(returns)
-        return advantages, returns
+        self.ret_rms.update(returns.reshape(-1))
+        return advantages.reshape(-1), returns.reshape(-1)
 
     def learn(self, last_value: torch.Tensor):
         T = self.memory.idx
-        states = self.memory.states[:T]
-        actions = self.memory.actions[:T]
-        old_log_probs = self.memory.log_probs[:T]
-        old_values = self.memory.critic_values[:T]
+        states = self.memory.states[:T].reshape(-1, self.memory.states.shape[-1])
+        actions = self.memory.actions[:T].reshape(-1, self.memory.actions.shape[-1])
+        old_log_probs = self.memory.log_probs[:T].reshape(-1)
+        old_values = self.memory.critic_values[:T].reshape(-1)
         advantages, returns = self._compute_gae(last_value)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)   # normalization per rollout
@@ -255,6 +267,72 @@ class Agent(object):
 
             with torch.no_grad():
                 last_value = self.critic(self._to_tensor(obs)).squeeze()
+            self.learn(last_value)
+
+            if history:
+                recent = [r for _, r in history[-10:]]
+                print(f"step {step:>8} | episodes {len(history):>5} | "
+                      f"mean return (last {len(recent)}): {np.mean(recent):.2f}")
+        return history
+
+    def ppo_parallel(self, env, total_steps, seed):
+        self.np_rng = np.random.default_rng(seed)
+
+        def next_seed():
+            return int(self.np_rng.integers(0, 2**31 - 1))
+
+        agents = env.possible_agents
+        space = env.action_space(agents[0])
+
+        history = []
+        obs, _ = env.reset(seed=next_seed())
+        ep_return = 0.0
+        step = 0
+
+        while step < total_steps:
+            self.memory.clear_memory()
+            for _ in range(self.horizon):
+                obs_t = torch.as_tensor(np.stack([obs[a] for a in agents]),
+                                        dtype=torch.float32, device=self.device)
+                with torch.no_grad():
+                    actions, log_probs = self.actor.act(obs_t)
+                    values = self.critic(obs_t).squeeze(-1)
+
+                actions_np = actions.cpu().numpy()
+                action_dict = {a: np.clip(actions_np[i], space.low, space.high)
+                               for i, a in enumerate(agents)}
+                next_obs, rewards, _, truncs, _ = env.step(action_dict)
+
+                reward_vec = torch.as_tensor([rewards[a] for a in agents],
+                                             dtype=torch.float32, device=self.device)
+                done_vec = torch.as_tensor([float(truncs[a]) for a in agents],
+                                           dtype=torch.float32, device=self.device)
+                ep_return += sum(rewards[a] for a in agents)
+                step += 1
+
+                truncated = not env.agents
+                if truncated:
+                    name_to_agent = {ag.name: ag for ag in env.world.agents}
+                    real_next = torch.as_tensor(
+                        np.stack([env.scenario.observation(name_to_agent[a], env.world) for a in agents]),
+                        dtype=torch.float32, device=self.device)
+                    with torch.no_grad():
+                        boot_value = self.ret_rms.denormalize(self.critic(real_next).squeeze(-1))
+                    reward_vec = reward_vec + self.gamma * boot_value
+
+                self.memory.store_timestep(obs_t, actions, reward_vec, values, log_probs, done_vec)
+
+                if truncated:
+                    history.append((step, ep_return))
+                    ep_return = 0.0
+                    obs, _ = env.reset(seed=next_seed())
+                else:
+                    obs = next_obs
+
+            last_obs = torch.as_tensor(np.stack([obs[a] for a in agents]),
+                                       dtype=torch.float32, device=self.device)
+            with torch.no_grad():
+                last_value = self.critic(last_obs).squeeze(-1)
             self.learn(last_value)
 
             if history:
